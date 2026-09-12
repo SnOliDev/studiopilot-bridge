@@ -35,9 +35,11 @@ Dépôt cible : `studiopilot-bridge/` (GPL, séparé de l'app)
 - [x] Confirmé par Olivier en conditions réelles : `ping` fonctionne
   parfaitement (correctif opérateur modal validé)
 - [x] Session 4 Bloc 1 : get_scene_info
+- [x] Confirmé par Olivier en conditions réelles : `get_scene_info` lit
+  correctement sa scène (3 objets, caméra, moteur EEVEE détectés)
+- [x] Session 5 Bloc 1 : get_screenshot
 
 ## 🔄 Prochaines tâches (dans l'ordre)
-- [ ] Session 5 Bloc 1 : get_screenshot
 - [ ] Session 6 Bloc 1 : liste noire sécurité + test_client.py + README
 
 ## ❌ Problèmes ouverts
@@ -66,7 +68,7 @@ bridge à un réseau non fiable avant la Session 6.
   `queue.Queue` + commande `ping`) + Session 3 (`execute_code`, opérateur
   modal remplaçant `bpy.app.timers`, refus propre des connexions
   supplémentaires, abandon des connexions silencieuses, port par défaut 9877)
-  + Session 4 (`get_scene_info`)
+  + Session 4 (`get_scene_info`) + Session 5 (`get_screenshot`)
 - `BLOC1_bridge_blender.md` — port 9876 → 9877 (cohérence avec CLAUDE.md)
 
 ## 🧪 Session 1 — ✅ Vérification
@@ -240,20 +242,82 @@ la scène factory-default, pas une scène de travail réelle.
 = zéro résultat. Aucune donnée sensible dans `get_scene_info` (uniquement
 des données géométriques/matériaux de la scène).
 
+## 🧪 Session 5 — ✅ Vérification
+**Fichiers touchés** : `studiopilot_bridge.py`.
+
+**Effet attendu** : commande `get_screenshot` — capture le viewport actif
+via `bpy.ops.render.opengl(view_context=True)` (context override sur la
+première zone VIEW_3D/région WINDOW trouvée dans n'importe quelle fenêtre
+ouverte), redimensionnée en ajustant `resolution_percentage` (jamais
+`resolution_x/y`, pour ne pas altérer les réglages du projet) afin que le
+plus grand côté soit ≤ `max_size` (défaut 800), encodée en PNG ou JPEG
+(`params.format`) puis en base64. Réglages de rendu (filepath, format,
+résolution %) toujours restaurés via `try/finally`, fichier temporaire
+(`bpy.app.tempdir`) toujours supprimé après lecture — y compris en cas
+d'erreur. Repli sur un rendu complet (`bpy.ops.render.render`) si aucun
+viewport n'est utilisable (ex. mode `--background` — ne se produit jamais
+en usage réel, l'app StudioPilot suppose toujours un Blender GUI ouvert).
+
+**🐛 Deux bugs trouvés et corrigés pendant le test** :
+1. `_find_view3d_context()` trouvait une zone VIEW_3D même en mode
+   `--background` (Blender conserve la mise en page fenêtre/écran du
+   fichier de démarrage même sans contexte OpenGL réel), ce qui faisait
+   planter `bpy.ops.render.opengl` avec *"Cannot use OpenGL render in
+   background mode"*. Corrigé en vérifiant `bpy.app.background` en premier.
+2. Le nom de fichier réellement écrit par Blender pour un rendu still
+   (`write_still=True`) ne correspondait pas à celui calculé par
+   `render.frame_path()` (suffixe de numéro de frame ajouté à tort).
+   Remplacé par une recherche `glob` sur le préfixe unique (UUID) du
+   fichier temporaire — plus robuste, ne dépend d'aucune supposition sur
+   le format de nom de Blender.
+3. (mineur) `resolution_percentage` arrondi au plus proche pouvait dépasser
+   `max_size` de quelques pixels (806 au lieu de ≤800) — remplacé par un
+   arrondi par défaut (`floor`) pour garantir strictement la limite.
+
+**Ce qui a été testé** (headless, hors GUI) : le rendu logiciel dans cet
+environnement (pas de GPU) prend ~70-90 s par capture (chemin de repli
+"rendu complet" — en usage réel avec viewport OpenGL + GPU, c'est quasi
+instantané). Pour éviter le mismatch avec `_COMMAND_TIMEOUT_S` (30 s), la
+fonction `_cmd_get_screenshot()` a été testée en appel direct (sans passer
+par le socket) — le round-trip socket/queue/dispatch lui-même est déjà
+prouvé par les Sessions 2-4 sur exactement le même chemin de code :
+- Scène par défaut : PNG valide (magic number), 787×442 ≤ 800, fichier
+  temp nettoyé, réglages de rendu restaurés.
+- `max_size: 200, format: "jpeg"` : JPEG valide (magic bytes), 192×108 ≤ 200.
+- `max_size` négatif → `TypeError` propre, pas de rendu déclenché.
+- `format` invalide (`"tiff"`) → `ValueError` propre, pas de rendu déclenché.
+- 200 objets ajoutés → capture réussie, pas de fuite de fichier temporaire.
+- 0 objet (donc aucune caméra) → échoue proprement (`RuntimeError: Cannot
+  render, no camera`), pas de crash Blender, réglages de rendu restaurés
+  malgré l'échec (`try/finally` validé sur le chemin d'erreur aussi).
+
+**⚠️ Ce qui n'a PAS pu être testé (limitation `--background`)** : le chemin
+`bpy.ops.render.opengl` via un vrai viewport (nécessite une fenêtre Blender
+réelle avec contexte OpenGL, comme l'opérateur modal de la Session 3).
+🔄 **Confirmation manuelle nécessaire par Olivier** : demander un
+`get_screenshot` via un client réel doit renvoyer quasi instantanément une
+image du viewport actuel (pas un rendu caméra) — objectif < 500 Ko et
+< 1 s en usage normal.
+
+**Sécurité** : bind `127.0.0.1` uniquement, `grep "0.0.0.0"`/`grep "sk-ant"`
+= zéro résultat. Aucune fuite de fichier temporaire constatée dans aucun cas
+testé, y compris les chemins d'erreur.
+
 ## ▶️ Prochaine étape exacte
-Session 5 Bloc 1 : commande `get_screenshot` — rendu OpenGL du viewport
-(`bpy.ops.render.opengl` ou rendu offscreen `gpu` si aucun viewport),
-redimensionné (`max_size`, défaut 800px), PNG en base64, fichier temporaire
-supprimé après lecture. 🔄 À tester manuellement avec 0/1/200 objets (§
-Vérification Bloc 1).
+Session 6 Bloc 1 (dernière session du bloc) : liste noire de sécurité
+côté add-on (défense en profondeur sur `execute_code` — `os.system`,
+`subprocess`, `shutil.rmtree`, `socket.`, `urllib`, `requests`, `eval(`,
+`__import__`, `ctypes`, `sys.exit`, `exec(`), `test_client.py` complet
+(les 6 tests de la spec Bloc 1), et README (installation + licence GPL).
+Critère de sortie du Bloc 1 : les 6 tests de `test_client.py` passent sur
+Windows + Blender 4.2.
 
 ## 🙋 Pour toi, Olivier
-Rien de bloquant. Si tu veux valider Session 4 en conditions réelles :
-réinstalle `studiopilot_bridge.py` mis à jour (désactive/réactive l'add-on
-ou redémarre Blender), redémarre le serveur, puis envoie une requête
-`get_scene_info` sur ta scène de travail (je peux te fournir un script ou tu
-peux adapter `ping_test.py`) pour vérifier que le contenu reflète bien ta
-scène réelle.
+Rien de bloquant. Si tu veux valider Session 5 en conditions réelles :
+réinstalle `studiopilot_bridge.py` mis à jour, redémarre le serveur, et
+demande un `get_screenshot` (je peux t'écrire un script comme pour les
+sessions précédentes) — ça doit répondre vite avec une image de ton
+viewport actuel, pas un rendu caméra complet.
 
 ---
 

@@ -45,13 +45,16 @@ conditions réelles, confirmé) :
      connexion silencieuse au bout de quelques secondes pour libérer
      la place pour un vrai client.
 Session 4 : commande `get_scene_info`.
-get_screenshot arrive en Session 5.
+Session 5 : commande `get_screenshot`.
 """
 
+import base64
 import contextlib
+import glob
 import io
 import json
 import math
+import os
 import queue
 import random
 import socket
@@ -60,6 +63,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 
 import bpy
 import mathutils
@@ -255,12 +259,126 @@ def _cmd_get_scene_info(params):
     }
 
 
+_SCREENSHOT_FORMATS = {"png": "PNG", "jpeg": "JPEG", "jpg": "JPEG"}
+
+
+def _find_view3d_context():
+    """Cherche une zone VIEW_3D avec une région WINDOW, dans n'importe
+    quelle fenêtre ouverte. Retourne (window, area, region), ou None si
+    aucune n'est utilisable.
+
+    ⚠️ En mode `--background`, Blender conserve la mise en page
+    fenêtre/écran/zone du fichier de démarrage par défaut MÊME SANS aucun
+    contexte OpenGL réel — `window_manager.windows` n'est donc PAS vide et
+    une zone VIEW_3D "fantôme" y est trouvée, ce qui ferait planter
+    `bpy.ops.render.opengl` avec "Cannot use OpenGL render in background
+    mode". `bpy.app.background` est le signal fiable pour détecter ce cas
+    et basculer directement sur le repli rendu complet (découvert en testant
+    cette commande en headless)."""
+    if bpy.app.background:
+        return None
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == "VIEW_3D":
+                for region in area.regions:
+                    if region.type == "WINDOW":
+                        return window, area, region
+    return None
+
+
+def _cmd_get_screenshot(params):
+    """Capture le viewport actif (§ get_screenshot spec Bloc 1). Modifie
+    temporairement les réglages de rendu de la scène active (filepath,
+    format, résolution %) puis les restaure toujours (try/finally) — cette
+    commande ne doit jamais altérer les réglages de rendu réels de
+    l'utilisateur."""
+    max_size = params.get("max_size", 800)
+    if not isinstance(max_size, int) or isinstance(max_size, bool) or max_size <= 0:
+        raise TypeError("params.max_size doit être un entier > 0")
+
+    format_key = str(params.get("format", "png")).lower()
+    if format_key not in _SCREENSHOT_FORMATS:
+        raise ValueError(f"format non supporté : {format_key!r} (attendu : {sorted(_SCREENSHOT_FORMATS)})")
+    file_format = _SCREENSHOT_FORMATS[format_key]
+
+    scene = bpy.context.scene
+    render = scene.render
+    view3d_ctx = _find_view3d_context()
+
+    temp_path = os.path.join(bpy.app.tempdir, f"studiopilot_screenshot_{uuid.uuid4().hex}")
+
+    original_filepath = render.filepath
+    original_file_format = render.image_settings.file_format
+    original_percentage = render.resolution_percentage
+
+    largest_side = max(render.resolution_x, render.resolution_y, 1)
+    target_percentage = min(100.0, 100.0 * max_size / largest_side)
+
+    try:
+        render.filepath = temp_path
+        render.image_settings.file_format = file_format
+        # floor (pas round) : garantit que la sortie ne dépasse JAMAIS
+        # max_size — un arrondi au plus proche peut pousser un pixel au-delà
+        # (constaté : 41.67% arrondi à 42% donnait 806px pour max_size=800).
+        render.resolution_percentage = max(1, math.floor(target_percentage))
+
+        if view3d_ctx is not None:
+            window, area, region = view3d_ctx
+            with bpy.context.temp_override(window=window, area=area, region=region):
+                bpy.ops.render.opengl(write_still=True, view_context=True)
+        else:
+            # Aucun viewport disponible (ex. mode --background) : repli sur
+            # un rendu complet depuis la caméra active. Moins fidèle à "ce
+            # que voit l'utilisateur" qu'un rendu viewport, mais évite de
+            # réimplémenter un rendu offscreen GPU complet pour un cas qui
+            # ne se présente jamais en usage réel (app StudioPilot = GUI
+            # Blender toujours ouverte avec un viewport).
+            bpy.ops.render.render(write_still=True)
+    finally:
+        render.filepath = original_filepath
+        render.image_settings.file_format = original_file_format
+        render.resolution_percentage = original_percentage
+
+    # Le nom de fichier réellement écrit par Blender pour un rendu "still"
+    # ne correspond pas toujours à render.frame_path() (celui-ci ajoute un
+    # suffixe de numéro de frame que write_still=True n'utilise pas
+    # toujours — constaté en testant cette commande). Le préfixe étant unique
+    # (UUID), un glob retrouve le fichier réel sans avoir à deviner le
+    # suffixe/extension exacts.
+    matches = glob.glob(temp_path + "*")
+    if not matches:
+        raise RuntimeError(f"Le rendu n'a produit aucun fichier (préfixe attendu : {temp_path})")
+    output_path = matches[0]
+
+    try:
+        image_datablock = bpy.data.images.load(output_path, check_existing=False)
+        try:
+            width, height = image_datablock.size[0], image_datablock.size[1]
+        finally:
+            bpy.data.images.remove(image_datablock)
+
+        with open(output_path, "rb") as image_file:
+            image_bytes = image_file.read()
+    finally:
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
+
+    return {
+        "image_base64": base64.b64encode(image_bytes).decode("ascii"),
+        "width": width,
+        "height": height,
+    }
+
+
 # Registre des commandes supportées. Ajouter une commande = ajouter une
 # fonction ci-dessus + une entrée ici, zéro modification de la boucle.
 _COMMAND_HANDLERS = {
     "ping": _cmd_ping,
     "execute_code": _cmd_execute_code,
     "get_scene_info": _cmd_get_scene_info,
+    "get_screenshot": _cmd_get_screenshot,
 }
 
 
