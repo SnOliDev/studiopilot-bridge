@@ -26,13 +26,19 @@ l'application StudioPilot (propriétaire, dépôt séparé) de piloter Blender.
 Cet add-on ne communique QUE par socket : il ne contient et n'embarque
 aucun code de l'application StudioPilot.
 
-Session 1 (squelette) : panneau N, start/stop serveur, indicateur d'état.
-Le protocole de commandes (ping, execute_code, ...) arrive en Session 2+.
+Session 1 : panneau N, start/stop serveur, indicateur d'état.
+Session 2 : protocole JSON préfixé longueur, boucle queue.Queue +
+bpy.app.timers, commande `ping`. execute_code/get_scene_info/get_screenshot
+arrivent en Sessions 3-5.
 """
 
+import json
+import queue
 import socket
+import struct
 import sys
 import threading
+import traceback
 
 import bpy
 
@@ -49,6 +55,11 @@ bl_info = {
 # Bind loopback uniquement — ne jamais écouter sur toutes les interfaces.
 _HOST = "127.0.0.1"
 
+# Timeout d'exécution d'une commande (§5 spec Bloc 1). Au-delà, le thread
+# socket répond TimeoutError au client ; la commande peut néanmoins finir
+# de s'exécuter plus tard sur le thread principal (résultat alors ignoré).
+_COMMAND_TIMEOUT_S = 30.0
+
 # État partagé entre le thread principal (UI/bpy) et le thread socket.
 # Lectures/écritures de valeurs simples (bool/str/None) : sûres sous CPython
 # grâce au GIL, aucun verrou nécessaire pour cet usage.
@@ -60,11 +71,169 @@ _state = {
     "stop_event": None,
 }
 
+# Requêtes en attente d'exécution sur le thread principal. Chaque item :
+# (request: dict, response_box: dict, response_event: threading.Event).
+# bpy n'étant pas thread-safe, c'est le SEUL canal par lequel le thread
+# socket déclenche du travail lié à bpy.
+_request_queue = queue.Queue()
+
+
+def _cmd_ping(params):
+    """Exécuté sur le thread principal (bpy.app.version_string lit l'état
+    Blender). Ne fait aucune supposition sur `params`."""
+    return {
+        "pong": True,
+        "blender_version": bpy.app.version_string,
+        "addon_version": ".".join(str(part) for part in bl_info["version"]),
+    }
+
+
+# Registre des commandes supportées. Ajouter une commande = ajouter une
+# fonction ci-dessus + une entrée ici, zéro modification de la boucle.
+_COMMAND_HANDLERS = {
+    "ping": _cmd_ping,
+}
+
+
+def _process_queue():
+    """Timer bpy.app.timers — SEUL point d'exécution des commandes bpy.
+    Dépile tout ce qui est disponible sans bloquer, puis se réenregistre
+    tant que le serveur tourne."""
+    if not _state["running"]:
+        return None
+
+    while True:
+        try:
+            request, response_box, response_event = _request_queue.get_nowait()
+        except queue.Empty:
+            break
+
+        request_id = request.get("id")
+        command = request.get("command")
+        params = request.get("params") or {}
+        handler = _COMMAND_HANDLERS.get(command)
+
+        try:
+            if handler is None:
+                raise KeyError(f"Commande inconnue : {command}")
+            result = handler(params)
+            response = {"id": request_id, "status": "ok", "result": result, "error": None}
+        except Exception as exc:  # noqa: BLE001 - renvoyé au client, jamais avalé
+            response = {
+                "id": request_id,
+                "status": "error",
+                "result": None,
+                "error": {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                    "traceback": traceback.format_exc(),
+                },
+            }
+
+        response_box["response"] = response
+        response_event.set()
+
+    return 0.05
+
+
+def _error_response(request_id, error_type, message):
+    return {
+        "id": request_id,
+        "status": "error",
+        "result": None,
+        "error": {"type": error_type, "message": message, "traceback": None},
+    }
+
+
+def _recv_exact(conn, size, stop_event):
+    """Lit exactement `size` octets. Retourne None si le client se
+    déconnecte ou si l'arrêt du serveur est demandé pendant l'attente."""
+    buf = bytearray()
+    while len(buf) < size:
+        if stop_event.is_set():
+            return None
+        try:
+            chunk = conn.recv(size - len(buf))
+        except socket.timeout:
+            continue
+        except OSError:
+            return None
+        if not chunk:
+            return None
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _recv_message(conn, stop_event):
+    """Lit un message JSON préfixé longueur (4 octets big-endian). Retourne
+    None sur déconnexion/arrêt. Peut lever ValueError si le JSON est
+    invalide — géré par l'appelant."""
+    header = _recv_exact(conn, 4, stop_event)
+    if header is None:
+        return None
+    (length,) = struct.unpack(">I", header)
+    payload = _recv_exact(conn, length, stop_event)
+    if payload is None:
+        return None
+    return json.loads(payload.decode("utf-8"))
+
+
+def _send_message(conn, obj):
+    payload = json.dumps(obj).encode("utf-8")
+    conn.sendall(struct.pack(">I", len(payload)) + payload)
+
+
+def _dispatch(request):
+    """Appelé depuis le thread socket. Pousse la requête dans la queue et
+    attend la réponse produite par _process_queue sur le thread principal —
+    ne touche jamais bpy directement."""
+    request_id = request.get("id") if isinstance(request, dict) else None
+
+    if not isinstance(request, dict) or "command" not in request:
+        return _error_response(request_id, "ProtocolError", "Requête invalide : champ 'command' manquant")
+
+    command = request["command"]
+    if command not in _COMMAND_HANDLERS:
+        return _error_response(request_id, "UnknownCommand", f"Commande inconnue : {command}")
+
+    response_box = {}
+    response_event = threading.Event()
+    _request_queue.put((request, response_box, response_event))
+
+    if not response_event.wait(timeout=_COMMAND_TIMEOUT_S):
+        return _error_response(
+            request_id, "TimeoutError", f"Commande '{command}' : délai de {_COMMAND_TIMEOUT_S}s dépassé"
+        )
+    return response_box["response"]
+
+
+def _handle_client(conn, stop_event):
+    conn.settimeout(0.5)
+    while not stop_event.is_set():
+        try:
+            request = _recv_message(conn, stop_event)
+        except (ValueError, UnicodeDecodeError) as exc:
+            try:
+                _send_message(conn, _error_response(None, "ProtocolError", f"JSON invalide : {exc}"))
+            except OSError:
+                break
+            continue
+
+        if request is None:
+            break  # client déconnecté ou arrêt demandé
+
+        response = _dispatch(request)
+        try:
+            _send_message(conn, response)
+        except OSError:
+            break
+
 
 def _accept_loop(server_socket, stop_event):
     """Tourne dans un thread séparé. N'appelle JAMAIS bpy — bpy n'est pas
-    thread-safe. Se contente d'accepter une connexion et de la maintenir
-    ouverte ; le protocole de commandes arrive en Session 2."""
+    thread-safe. Accepte une connexion, délègue à _handle_client (protocole
+    JSON préfixé longueur), qui pousse les commandes dans _request_queue
+    pour exécution sur le thread principal via bpy.app.timers."""
     server_socket.settimeout(0.5)
     try:
         while not stop_event.is_set():
@@ -77,18 +246,7 @@ def _accept_loop(server_socket, stop_event):
 
             _state["client_connected"] = True
             try:
-                conn.settimeout(0.5)
-                while not stop_event.is_set():
-                    try:
-                        chunk = conn.recv(4096)
-                    except socket.timeout:
-                        continue
-                    except OSError:
-                        break
-                    if not chunk:
-                        break
-                    # Session 1 : pas encore de protocole, les données
-                    # reçues sont ignorées (voir Session 2 : queue + timers).
+                _handle_client(conn, stop_event)
             finally:
                 _state["client_connected"] = False
                 try:
@@ -157,6 +315,7 @@ class STUDIOPILOT_OT_start_server(bpy.types.Operator):
         thread.start()
 
         bpy.app.timers.register(_redraw_timer, first_interval=0.3)
+        bpy.app.timers.register(_process_queue, first_interval=0.05)
         return {"FINISHED"}
 
 
@@ -178,6 +337,15 @@ class STUDIOPILOT_OT_stop_server(bpy.types.Operator):
         _state["thread"] = None
         _state["stop_event"] = None
         _state["client_connected"] = False
+
+        # Purge les requêtes non traitées (ex. client déconnecté avant
+        # réponse) pour ne pas les faire réapparaître au prochain démarrage.
+        while True:
+            try:
+                _request_queue.get_nowait()
+            except queue.Empty:
+                break
+
         return {"FINISHED"}
 
 
@@ -219,7 +387,7 @@ class StudioPilotBridgePreferences(bpy.types.AddonPreferences):
     port: bpy.props.IntProperty(
         name="Port",
         description="Port TCP local du serveur StudioPilot (127.0.0.1 uniquement)",
-        default=9876,
+        default=9877,
         min=1024,
         max=65535,
     )

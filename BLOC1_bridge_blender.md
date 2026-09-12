@@ -44,7 +44,7 @@ Un add-on **mono-fichier** suffit et simplifie l'installation
 
 ### 1. Serveur socket
 
-- TCP, **bind 127.0.0.1 uniquement** (jamais 0.0.0.0), port **9876**
+- TCP, **bind 127.0.0.1 uniquement** (jamais 0.0.0.0), port **9877**
   (configurable dans les préférences de l'add-on).
 - Un seul client à la fois (l'app StudioPilot). Refuser proprement les connexions
   supplémentaires avec une erreur JSON.
