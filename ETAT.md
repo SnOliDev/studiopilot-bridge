@@ -92,3 +92,4 @@ round-trip complet (client TCP → réponse JSON préfixée longueur).
 - Socket TCP 127.0.0.1:9876, préfixe longueur 4 octets big-endian
 - bpy NON thread-safe → queue.Queue + bpy.app.timers obligatoires
 - Branches Git : `dev` (travail Claude Code) / `main` (merge Olivier uniquement)
+- Port 9877 sur ce PC dev (9876 occupé par BlenderMCP)

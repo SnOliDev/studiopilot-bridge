@@ -20,7 +20,7 @@
 [Utilisateur]
      ↓ langage naturel
 [StudioPilot App — Tauri + React] ← propriétaire, commercial
-     ↓ JSON via socket TCP 127.0.0.1:9876
+     ↓ JSON via socket TCP 127.0.0.1:9877
 [Add-on studiopilot_bridge.py — Blender] ← GPL, dépôt séparé
      ↓ bpy (thread principal uniquement)
 [Blender 4.2 LTS — officiel, non modifié]
@@ -65,7 +65,7 @@
 
 - **Clé API Anthropic** : JAMAIS en dur. Variable d'environnement ou keychain OS.
   `grep -r "sk-ant"` doit rendre zéro résultat avant tout commit.
-- **Socket Blender** : bind 127.0.0.1:9876 UNIQUEMENT. `grep "0.0.0.0"` = zéro résultat.
+- **Socket Blender** : bind 127.0.0.1:9877 UNIQUEMENT. `grep "0.0.0.0"` = zéro résultat.
 - **Code LLM** : exécuté UNIQUEMENT dans Blender via socket, jamais `eval()` côté app.
 - **Liste noire sandbox** (côté app, Bloc 4, ET côté add-on en défense profondeur) :
   `os.system`, `subprocess`, `shutil.rmtree`, `socket.`, `urllib`, `requests`,
