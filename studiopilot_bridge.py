@@ -30,7 +30,8 @@ Session 1 : panneau N, start/stop serveur, indicateur d'état.
 Session 2 : protocole JSON préfixé longueur, boucle queue.Queue +
 bpy.app.timers, commande `ping`.
 Session 3 : commande `execute_code`. + deux correctifs confirmés
-manuellement par Olivier sur le round-trip Session 2 :
+manuellement par Olivier sur le round-trip Session 2 (ping fonctionne en
+conditions réelles, confirmé) :
   1. bpy.app.timers ne se déclenche pas de façon fiable sans interaction
      Blender (le bpy.app.timers registré en Session 2 dépendait du cycle
      de redraw) → remplacé par un opérateur modal avec un timer de
@@ -43,7 +44,8 @@ manuellement par Olivier sur le round-trip Session 2 :
      supplémentaire pendant qu'un client est actif, et abandonne une
      connexion silencieuse au bout de quelques secondes pour libérer
      la place pour un vrai client.
-get_scene_info/get_screenshot arrivent en Sessions 4-5.
+Session 4 : commande `get_scene_info`.
+get_screenshot arrive en Session 5.
 """
 
 import contextlib
@@ -140,11 +142,125 @@ def _cmd_execute_code(params):
     return {"stdout": stdout_capture.getvalue(), "executed": True}
 
 
+def _round_vec(vec, ndigits=4):
+    return [round(float(v), ndigits) for v in vec]
+
+
+def _material_info(material):
+    """Base_color/metallic/roughness : priorité au node Principled BSDF
+    (reflète ce qui est réellement rendu — voir skill bpy-blender), repli sur
+    les propriétés "affichage viewport" du matériau (toujours présentes,
+    jamais de KeyError même sans nodes ou avec un shader personnalisé)."""
+    info = {
+        "name": material.name,
+        "base_color": _round_vec(material.diffuse_color),
+        "metallic": round(material.metallic, 4),
+        "roughness": round(material.roughness, 4),
+    }
+
+    if material.use_nodes and material.node_tree is not None:
+        principled = material.node_tree.nodes.get("Principled BSDF")
+        if principled is not None:
+            base_color_input = principled.inputs.get("Base Color")
+            metallic_input = principled.inputs.get("Metallic")
+            roughness_input = principled.inputs.get("Roughness")
+            if base_color_input is not None:
+                info["base_color"] = _round_vec(base_color_input.default_value)
+            if metallic_input is not None:
+                info["metallic"] = round(metallic_input.default_value, 4)
+            if roughness_input is not None:
+                info["roughness"] = round(roughness_input.default_value, 4)
+
+    return info
+
+
+def _cmd_get_scene_info(params):
+    """État compact de la scène active — destiné au contexte LLM (Bloc 3),
+    chaque token compte (§4 spec Bloc 1). `objects` est tronqué à
+    `max_objects` (défaut 100) ; `lights`/`materials`/`camera` couvrent
+    toute la scène (généralement peu nombreux, utiles même si les objets
+    sont tronqués)."""
+    max_objects = params.get("max_objects", 100)
+    if not isinstance(max_objects, int) or isinstance(max_objects, bool) or max_objects < 0:
+        raise TypeError("params.max_objects doit être un entier >= 0")
+
+    scene = bpy.context.scene
+    all_objects = list(scene.objects)
+    object_count_total = len(all_objects)
+    truncated = object_count_total > max_objects
+
+    objects_info = []
+    material_names_seen = set()
+    for obj in all_objects[:max_objects]:
+        slot_material_names = [slot.material.name for slot in obj.material_slots if slot.material is not None]
+        material_names_seen.update(slot_material_names)
+        objects_info.append(
+            {
+                "name": obj.name,
+                "type": obj.type,
+                "location": _round_vec(obj.location),
+                "rotation_euler": _round_vec(obj.rotation_euler),
+                "scale": _round_vec(obj.scale),
+                "dimensions": _round_vec(obj.dimensions),
+                "materials": slot_material_names,
+                "visible": obj.visible_get(),
+            }
+        )
+
+    camera_obj = scene.camera
+    camera_info = None
+    if camera_obj is not None:
+        camera_info = {
+            "name": camera_obj.name,
+            "location": _round_vec(camera_obj.location),
+            "rotation_euler": _round_vec(camera_obj.rotation_euler),
+            "lens_mm": round(camera_obj.data.lens, 4) if camera_obj.data is not None else None,
+        }
+
+    lights_info = [
+        {
+            "name": obj.name,
+            "type": obj.data.type,
+            "energy": round(obj.data.energy, 4),
+            "location": _round_vec(obj.location),
+        }
+        for obj in all_objects
+        if obj.type == "LIGHT" and obj.data is not None
+    ]
+
+    materials_info = [
+        _material_info(bpy.data.materials[name])
+        for name in sorted(material_names_seen)
+        if name in bpy.data.materials
+    ]
+
+    fps_base = scene.render.fps_base or 1.0
+
+    return {
+        "scene_name": scene.name,
+        "frame_current": scene.frame_current,
+        "frame_start": scene.frame_start,
+        "frame_end": scene.frame_end,
+        "objects": objects_info,
+        "object_count_total": object_count_total,
+        "truncated": truncated,
+        "camera": camera_info,
+        "lights": lights_info,
+        "materials": materials_info,
+        "render": {
+            "engine": scene.render.engine,
+            "resolution": [scene.render.resolution_x, scene.render.resolution_y],
+            "fps": round(scene.render.fps / fps_base, 4),
+        },
+    }
+
+
 # Registre des commandes supportées. Ajouter une commande = ajouter une
 # fonction ci-dessus + une entrée ici, zéro modification de la boucle.
 _COMMAND_HANDLERS = {
     "ping": _cmd_ping,
     "execute_code": _cmd_execute_code,
+    "get_scene_info": _cmd_get_scene_info,
 }
 
 

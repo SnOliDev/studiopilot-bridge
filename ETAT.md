@@ -32,9 +32,11 @@ Dépôt cible : `studiopilot-bridge/` (GPL, séparé de l'app)
   connexions supplémentaires + abandon d'une connexion silencieuse après
   5 s (probe/health-check externe, probablement BlenderMCP)
 - [x] Session 3 Bloc 1 : execute_code + stdout + gestion erreurs
+- [x] Confirmé par Olivier en conditions réelles : `ping` fonctionne
+  parfaitement (correctif opérateur modal validé)
+- [x] Session 4 Bloc 1 : get_scene_info
 
 ## 🔄 Prochaines tâches (dans l'ordre)
-- [ ] Session 4 Bloc 1 : get_scene_info
 - [ ] Session 5 Bloc 1 : get_screenshot
 - [ ] Session 6 Bloc 1 : liste noire sécurité + test_client.py + README
 
@@ -64,6 +66,7 @@ bridge à un réseau non fiable avant la Session 6.
   `queue.Queue` + commande `ping`) + Session 3 (`execute_code`, opérateur
   modal remplaçant `bpy.app.timers`, refus propre des connexions
   supplémentaires, abandon des connexions silencieuses, port par défaut 9877)
+  + Session 4 (`get_scene_info`)
 - `BLOC1_bridge_blender.md` — port 9876 → 9877 (cohérence avec CLAUDE.md)
 
 ## 🧪 Session 1 — ✅ Vérification
@@ -200,24 +203,57 @@ maintenant une réponse SANS bouger la souris ni interagir avec la fenêtre
 depuis le départ) — ne pas connecter d'app tierce non fiable à ce port avant
 la Session 6.
 
+## 🧪 Session 4 — ✅ Vérification
+**Fichiers touchés** : `studiopilot_bridge.py`.
+
+**Effet attendu** : commande `get_scene_info` complète conforme au schéma
+§4 de la spec Bloc 1 — `scene_name`, `frame_current/start/end`, `objects`
+(tronqué à `max_objects`, défaut 100), `object_count_total`, `truncated`,
+`camera` (ou `null` si aucune caméra active), `lights`, `materials`
+(dédupliqués, uniquement ceux référencés par les objets renvoyés), `render`
+(engine/résolution/fps, fps calculé via `fps/fps_base` pour gérer les
+fréquences fractionnaires type 29.97). Tous les floats arrondis à 4
+décimales. `camera`/`lights` couvrent TOUTE la scène (pas limités par
+`max_objects`) car peu nombreux et utiles même si `objects` est tronqué.
+Matériaux lus en priorité via le node Principled BSDF (valeurs réellement
+rendues), repli sur les propriétés "affichage viewport" du matériau si pas
+de setup nodes (jamais de crash).
+
+**Ce qui a été testé** (headless, hors GUI, port 19877) :
+- Scène par défaut (Cube/Light/Camera) : schéma complet correct,
+  `object_count_total == 3`, `truncated == False`, 1 lumière, caméra avec
+  `lens_mm` numérique, matériau du Cube avec `base_color`/`metallic`/
+  `roughness` corrects.
+- Arrondi à 4 décimales vérifié (`1.234567891` → `1.2346`).
+- `max_objects: 0` → `objects` vide, `truncated: True`, mais `camera` et
+  `lights` toujours présents.
+- 200 objets ajoutés → `object_count_total >= 203`, `objects` tronqué à 100
+  (défaut), `truncated: True` ; avec `max_objects: 500` → plus de troncature.
+- `max_objects` invalide (chaîne) → `status: error`, `type: TypeError`, pas
+  de crash, le serveur répond normalement ensuite (`ping` final OK).
+
+**🔄 À confirmer par toi** : contenu réel dans TA scène Blender (objets,
+matériaux, éclairage de ton propre projet) — les tests ci-dessus utilisent
+la scène factory-default, pas une scène de travail réelle.
+
+**Sécurité** : bind `127.0.0.1` uniquement, `grep "0.0.0.0"`/`grep "sk-ant"`
+= zéro résultat. Aucune donnée sensible dans `get_scene_info` (uniquement
+des données géométriques/matériaux de la scène).
+
 ## ▶️ Prochaine étape exacte
-Session 4 Bloc 1 : commande `get_scene_info` (objets, matériaux, caméra,
-lumières, arrondi à 4 décimales, troncature si > `max_objects`).
+Session 5 Bloc 1 : commande `get_screenshot` — rendu OpenGL du viewport
+(`bpy.ops.render.opengl` ou rendu offscreen `gpu` si aucun viewport),
+redimensionné (`max_size`, défaut 800px), PNG en base64, fichier temporaire
+supprimé après lecture. 🔄 À tester manuellement avec 0/1/200 objets (§
+Vérification Bloc 1).
 
 ## 🙋 Pour toi, Olivier
-Deux choses à confirmer sur ta machine (Blender GUI déjà ouvert, port 9877) :
-1. Réinstalle `studiopilot_bridge.py` mis à jour (désactive/réactive l'add-on
-   ou redémarre Blender), redémarre le serveur, puis lance un `ping` externe
-   **sans toucher à la souris/fenêtre Blender** — ça doit répondre maintenant
-   (c'est le bug modal/timer corrigé).
-2. Vérifie si la connexion automatique mystère (probablement BlenderMCP) se
-   reproduit — elle devrait maintenant disparaître d'elle-même après ~5 s
-   sans bloquer le vrai client, et une tentative de connexion StudioPilot
-   pendant qu'un autre client est actif doit recevoir une erreur claire
-   plutôt que de rester bloquée.
-
-Dis-moi si tu veux que je lance un test `ping`/`execute_code` réel depuis un
-terminal une fois l'add-on rechargé.
+Rien de bloquant. Si tu veux valider Session 4 en conditions réelles :
+réinstalle `studiopilot_bridge.py` mis à jour (désactive/réactive l'add-on
+ou redémarre Blender), redémarre le serveur, puis envoie une requête
+`get_scene_info` sur ta scène de travail (je peux te fournir un script ou tu
+peux adapter `ping_test.py`) pour vérifier que le contenu reflète bien ta
+scène réelle.
 
 ---
 
