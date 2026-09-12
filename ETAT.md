@@ -26,27 +26,44 @@ Dépôt cible : `studiopilot-bridge/` (GPL, séparé de l'app)
 - [x] Port par défaut aligné sur **9877** (CLAUDE.md) — 9876 occupé par
   BlenderMCP sur la machine de dev
 - [x] Session 2 Bloc 1 : boucle queue + bpy.app.timers + commande ping
+- [x] Correctif confirmé par Olivier : bpy.app.timers → opérateur modal
+  (event_timer_add) pour un déclenchement fiable sans interaction Blender
+- [x] Correctif confirmé par Olivier : refus propre (BusyError JSON) des
+  connexions supplémentaires + abandon d'une connexion silencieuse après
+  5 s (probe/health-check externe, probablement BlenderMCP)
+- [x] Session 3 Bloc 1 : execute_code + stdout + gestion erreurs
 
 ## 🔄 Prochaines tâches (dans l'ordre)
-- [ ] Session 3 Bloc 1 : execute_code + stdout + gestion erreurs
 - [ ] Session 4 Bloc 1 : get_scene_info
 - [ ] Session 5 Bloc 1 : get_screenshot
 - [ ] Session 6 Bloc 1 : liste noire sécurité + test_client.py + README
 
 ## ❌ Problèmes ouverts
-Aucun pour l'instant.
+- ⚠️ **Limite connue et acceptée (pas bloquante)** : une connexion qui envoie
+  UN message invalide (garbage) puis reste ensuite silencieuse indéfiniment
+  occupe le slot client sans être expulsée — le délai de grâce
+  `_FIRST_MESSAGE_TIMEOUT_S` ne s'applique qu'avant le tout premier message
+  reçu, pas après. Pas de protocole de heartbeat prévu par la spec Bloc 1 ;
+  à surveiller si ça se reproduit en usage réel avec le vrai client
+  StudioPilot (Bloc 2/3).
 
 ## ⚠️ Questions bloquantes (attendre Olivier)
 Aucune pour l'instant.
 
 ## 🔒 Alertes sécurité
-Aucune. Vérifié en Session 1 et 2 : `grep "0.0.0.0"` et `grep "sk-ant"` sur
+Aucune. Vérifié en Session 1, 2 et 3 : `grep "0.0.0.0"` et `grep "sk-ant"` sur
 `studiopilot_bridge.py` = zéro résultat.
+⚠️ Rappel : `execute_code` (Session 3) n'a **aucune** liste noire — c'est prévu
+par la spec Bloc 1 (liste noire = Session 6, garde-fou de défense en
+profondeur, la vraie validation est côté app au Bloc 4). Ne pas exposer ce
+bridge à un réseau non fiable avant la Session 6.
 
 ## 📁 Fichiers modifiés ce jour
 - `studiopilot_bridge.py` — Session 1 (panneau N, start/stop serveur,
   indicateur ⚫/🟢/🔵) + Session 2 (protocole JSON préfixé longueur,
-  `queue.Queue` + `bpy.app.timers`, commande `ping`, port par défaut 9877)
+  `queue.Queue` + commande `ping`) + Session 3 (`execute_code`, opérateur
+  modal remplaçant `bpy.app.timers`, refus propre des connexions
+  supplémentaires, abandon des connexions silencieuses, port par défaut 9877)
 - `BLOC1_bridge_blender.md` — port 9876 → 9877 (cohérence avec CLAUDE.md)
 
 ## 🧪 Session 1 — ✅ Vérification
@@ -129,24 +146,86 @@ charger le nouveau fichier).
 aucun `eval`/`exec` de code externe (la commande `execute_code` et sa liste
 noire arrivent Session 3/6).
 
+## 🧪 Session 3 — ✅ Vérification
+**Fichiers touchés** : `studiopilot_bridge.py`.
+
+**Effet attendu** :
+1. **Commande `execute_code`** : `exec(code, namespace)` avec `bpy`, `math`,
+   `mathutils`, `random` dans le namespace, stdout capturé via
+   `contextlib.redirect_stdout(io.StringIO())`. Succès → `{"stdout":...,
+   "executed": true}`. Exception → `status: error` avec type/message/
+   traceback complet (géré par le wrapper générique déjà en place depuis
+   la Session 2, aucun code spécifique nécessaire). **Aucune liste noire**
+   à ce stade (prévue Session 6) — voir section Alertes sécurité.
+2. **Correctif bpy.app.timers → opérateur modal** (`STUDIOPILOT_OT_modal_server`) :
+   remplace le `bpy.app.timers.register(_process_queue, ...)` de la Session 2
+   par un opérateur modal avec `window_manager.event_timer_add(0.05, ...)`,
+   invoqué automatiquement au démarrage du serveur. `_process_queue()` et le
+   `tag_redraw` du panneau sont maintenant appelés à chaque événement TIMER
+   reçu par l'opérateur modal — mécanisme piloté par la boucle d'événements
+   de la fenêtre, indépendant de l'activité de redraw/souris.
+3. **Correctif connexions parasites** : `_accept_loop` accepte maintenant en
+   continu (jamais bloqué par le client en cours, qui vit dans son propre
+   thread `_serve_client`). Une connexion supplémentaire pendant qu'un
+   client est actif reçoit immédiatement `{"status":"error","error":
+   {"type":"BusyError",...}}` puis est fermée. Une connexion qui n'envoie
+   aucun octet dans les `_FIRST_MESSAGE_TIMEOUT_S` (5 s) est abandonnée,
+   libérant le slot pour un vrai client.
+
+**Ce qui a été testé** (headless, hors GUI, port 19877) :
+- `execute_code` : création d'un cube + `print()` → stdout capturé correctement.
+- `execute_code` avec erreur volontaire (`bpy.data.objects['Inexistant']`)
+  → `status: error`, `type: KeyError`, traceback présent (test 3 de la spec
+  Bloc 1, validé).
+- `execute_code` avec `params` vide → `code` par défaut `""`, no-op, status ok.
+- Une 2ᵉ connexion pendant qu'une 1ʳᵉ est active reçoit bien `BusyError` et
+  est fermée ; la 1ʳᵉ connexion reste active.
+- Une connexion qui ne parle pas (aucun octet envoyé) est bien fermée par le
+  serveur après ~5 s ; un nouveau client peut ensuite se connecter et obtenir
+  une réponse `ping` normale — le slot est bien libéré.
+
+**⚠️ Ce qui n'a PAS pu être testé (limitation du mode `--background`)** :
+le déclenchement de l'opérateur modal lui-même. Les opérateurs modaux, comme
+`bpy.app.timers`, dépendent de la boucle d'événements de la fenêtre Blender —
+absente en mode headless. Le test a pompé `_process_queue()` manuellement
+depuis le thread principal (= exactement ce que fait `modal()` à chaque
+TIMER en usage réel) pour valider la logique métier indépendamment du
+déclencheur. 🔄 **Confirmation manuelle nécessaire par Olivier** : redémarrer
+le serveur dans le Blender GUI et vérifier qu'un `ping` externe reçoit
+maintenant une réponse SANS bouger la souris ni interagir avec la fenêtre
+(c'était précisément le bug signalé).
+
+**Sécurité** : bind `127.0.0.1` uniquement, `grep "0.0.0.0"`/`grep "sk-ant"`
+= zéro résultat. `execute_code` sans liste noire (Session 6, planifié ainsi
+depuis le départ) — ne pas connecter d'app tierce non fiable à ce port avant
+la Session 6.
+
 ## ▶️ Prochaine étape exacte
-Session 3 Bloc 1 : commande `execute_code` — `exec(code, namespace)` avec
-`bpy`/`math`/`mathutils`/`random`, capture stdout via `io.StringIO`, et en
-cas d'exception : `status: error` avec type/message/traceback complet
-(prépare l'auto-correction LLM du Bloc 3).
+Session 4 Bloc 1 : commande `get_scene_info` (objets, matériaux, caméra,
+lumières, arrondi à 4 décimales, troncature si > `max_objects`).
 
 ## 🙋 Pour toi, Olivier
-Pour valider Session 2 en conditions réelles sur ta machine : dans le
-Blender déjà ouvert, désactive puis réactive l'add-on StudioPilot Bridge
-dans Preferences → Add-ons (ou redémarre Blender) après avoir réinstallé
-`studiopilot_bridge.py` mis à jour, redémarre le serveur (port 9877), puis
-dis-moi si tu veux que je lance un vrai `ping` dessus depuis un terminal.
+Deux choses à confirmer sur ta machine (Blender GUI déjà ouvert, port 9877) :
+1. Réinstalle `studiopilot_bridge.py` mis à jour (désactive/réactive l'add-on
+   ou redémarre Blender), redémarre le serveur, puis lance un `ping` externe
+   **sans toucher à la souris/fenêtre Blender** — ça doit répondre maintenant
+   (c'est le bug modal/timer corrigé).
+2. Vérifie si la connexion automatique mystère (probablement BlenderMCP) se
+   reproduit — elle devrait maintenant disparaître d'elle-même après ~5 s
+   sans bloquer le vrai client, et une tentative de connexion StudioPilot
+   pendant qu'un autre client est actif doit recevoir une erreur claire
+   plutôt que de rester bloquée.
+
+Dis-moi si tu veux que je lance un test `ping`/`execute_code` réel depuis un
+terminal une fois l'add-on rechargé.
 
 ---
 
 ## Contexte technique rappel
 - Blender 4.2 LTS, Windows
-- Socket TCP 127.0.0.1:9876, préfixe longueur 4 octets big-endian
-- bpy NON thread-safe → queue.Queue + bpy.app.timers obligatoires
+- Socket TCP 127.0.0.1:9877, préfixe longueur 4 octets big-endian
+- bpy NON thread-safe → queue.Queue + opérateur modal (event_timer_add)
+  obligatoires — bpy.app.timers abandonné (Session 3, peu fiable sans
+  interaction Blender)
 - Branches Git : `dev` (travail Claude Code) / `main` (merge Olivier uniquement)
 - Port 9877 sur ce PC dev (9876 occupé par BlenderMCP)

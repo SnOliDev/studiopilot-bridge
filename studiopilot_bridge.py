@@ -28,19 +28,39 @@ aucun code de l'application StudioPilot.
 
 Session 1 : panneau N, start/stop serveur, indicateur d'état.
 Session 2 : protocole JSON préfixé longueur, boucle queue.Queue +
-bpy.app.timers, commande `ping`. execute_code/get_scene_info/get_screenshot
-arrivent en Sessions 3-5.
+bpy.app.timers, commande `ping`.
+Session 3 : commande `execute_code`. + deux correctifs confirmés
+manuellement par Olivier sur le round-trip Session 2 :
+  1. bpy.app.timers ne se déclenche pas de façon fiable sans interaction
+     Blender (le bpy.app.timers registré en Session 2 dépendait du cycle
+     de redraw) → remplacé par un opérateur modal avec un timer de
+     window_manager (event_timer_add), qui reçoit des événements TIMER
+     même sans interaction utilisateur.
+  2. Un processus tiers (probablement BlenderMCP) se connecte
+     automatiquement au port dès le démarrage sans jamais envoyer de
+     requête → le serveur accepte maintenant chaque connexion dans son
+     propre thread, refuse proprement (JSON BusyError) toute connexion
+     supplémentaire pendant qu'un client est actif, et abandonne une
+     connexion silencieuse au bout de quelques secondes pour libérer
+     la place pour un vrai client.
+get_scene_info/get_screenshot arrivent en Sessions 4-5.
 """
 
+import contextlib
+import io
 import json
+import math
 import queue
+import random
 import socket
 import struct
 import sys
 import threading
+import time
 import traceback
 
 import bpy
+import mathutils
 
 bl_info = {
     "name": "StudioPilot Bridge",
@@ -59,6 +79,18 @@ _HOST = "127.0.0.1"
 # socket répond TimeoutError au client ; la commande peut néanmoins finir
 # de s'exécuter plus tard sur le thread principal (résultat alors ignoré).
 _COMMAND_TIMEOUT_S = 30.0
+
+# Délai laissé à une connexion pour envoyer son premier message valide.
+# Passé ce délai sans un seul octet reçu, on considère que ce n'est pas
+# un vrai client StudioPilot (ex. sonde/health-check d'un autre outil local
+# type BlenderMCP) et on libère la place. Ne s'applique plus une fois le
+# premier message reçu — un client légitime peut ensuite rester inactif
+# arbitrairement longtemps entre deux requêtes utilisateur.
+_FIRST_MESSAGE_TIMEOUT_S = 5.0
+
+# Taille max d'un message (garde-fou mémoire si le préfixe de longueur est
+# corrompu ou envoyé par un pair qui ne parle pas notre protocole).
+_MAX_MESSAGE_SIZE = 20 * 1024 * 1024
 
 # État partagé entre le thread principal (UI/bpy) et le thread socket.
 # Lectures/écritures de valeurs simples (bool/str/None) : sûres sous CPython
@@ -88,20 +120,38 @@ def _cmd_ping(params):
     }
 
 
+def _cmd_execute_code(params):
+    """Exécute du code bpy arbitraire sur le thread principal.
+
+    ⚠️ Aucune liste noire ici — c'est un garde-fou de défense en profondeur
+    prévu pour la Session 6 (§6 spec Bloc 1). La validation principale est
+    côté app StudioPilot (Bloc 4). Ne PAS considérer cette commande comme
+    sûre avant la Session 6.
+    """
+    code = params.get("code", "")
+    if not isinstance(code, str):
+        raise TypeError("params.code doit être une chaîne de caractères")
+
+    namespace = {"bpy": bpy, "math": math, "mathutils": mathutils, "random": random}
+    stdout_capture = io.StringIO()
+    with contextlib.redirect_stdout(stdout_capture):
+        exec(code, namespace)  # noqa: S102 - c'est la fonctionnalité même du bridge
+
+    return {"stdout": stdout_capture.getvalue(), "executed": True}
+
+
 # Registre des commandes supportées. Ajouter une commande = ajouter une
 # fonction ci-dessus + une entrée ici, zéro modification de la boucle.
 _COMMAND_HANDLERS = {
     "ping": _cmd_ping,
+    "execute_code": _cmd_execute_code,
 }
 
 
 def _process_queue():
-    """Timer bpy.app.timers — SEUL point d'exécution des commandes bpy.
-    Dépile tout ce qui est disponible sans bloquer, puis se réenregistre
-    tant que le serveur tourne."""
-    if not _state["running"]:
-        return None
-
+    """Appelé sur le thread principal à chaque tick TIMER de l'opérateur
+    modal (STUDIOPILOT_OT_modal_server) — SEUL point d'exécution des
+    commandes bpy. Dépile tout ce qui est disponible sans bloquer."""
     while True:
         try:
             request, response_box, response_event = _request_queue.get_nowait()
@@ -133,8 +183,6 @@ def _process_queue():
         response_box["response"] = response
         response_event.set()
 
-    return 0.05
-
 
 def _error_response(request_id, error_type, message):
     return {
@@ -145,12 +193,15 @@ def _error_response(request_id, error_type, message):
     }
 
 
-def _recv_exact(conn, size, stop_event):
+def _recv_exact(conn, size, stop_event, deadline=None):
     """Lit exactement `size` octets. Retourne None si le client se
-    déconnecte ou si l'arrêt du serveur est demandé pendant l'attente."""
+    déconnecte, si l'arrêt du serveur est demandé, ou si `deadline`
+    (time.monotonic()) est dépassée pendant l'attente."""
     buf = bytearray()
     while len(buf) < size:
         if stop_event.is_set():
+            return None
+        if deadline is not None and time.monotonic() > deadline:
             return None
         try:
             chunk = conn.recv(size - len(buf))
@@ -164,15 +215,18 @@ def _recv_exact(conn, size, stop_event):
     return bytes(buf)
 
 
-def _recv_message(conn, stop_event):
+def _recv_message(conn, stop_event, deadline=None):
     """Lit un message JSON préfixé longueur (4 octets big-endian). Retourne
-    None sur déconnexion/arrêt. Peut lever ValueError si le JSON est
-    invalide — géré par l'appelant."""
-    header = _recv_exact(conn, 4, stop_event)
+    None sur déconnexion/arrêt/deadline dépassée. Peut lever ValueError si
+    le JSON est invalide ou si le préfixe de longueur dépasse
+    _MAX_MESSAGE_SIZE — géré par l'appelant."""
+    header = _recv_exact(conn, 4, stop_event, deadline)
     if header is None:
         return None
     (length,) = struct.unpack(">I", header)
-    payload = _recv_exact(conn, length, stop_event)
+    if length > _MAX_MESSAGE_SIZE:
+        raise ValueError(f"message de {length} octets > limite {_MAX_MESSAGE_SIZE}")
+    payload = _recv_exact(conn, length, stop_event, deadline)
     if payload is None:
         return None
     return json.loads(payload.decode("utf-8"))
@@ -208,11 +262,20 @@ def _dispatch(request):
 
 
 def _handle_client(conn, stop_event):
+    """Boucle de traitement d'UN client déjà accepté. Tant qu'aucun message
+    valide n'a été reçu, une deadline courte (_FIRST_MESSAGE_TIMEOUT_S)
+    s'applique — voir le commentaire sur cette constante. Une fois un
+    premier message reçu (même invalide), le client est traité comme
+    légitime et peut rester inactif indéfiniment."""
     conn.settimeout(0.5)
+    got_first_message = False
+
     while not stop_event.is_set():
+        deadline = None if got_first_message else time.monotonic() + _FIRST_MESSAGE_TIMEOUT_S
         try:
-            request = _recv_message(conn, stop_event)
+            request = _recv_message(conn, stop_event, deadline)
         except (ValueError, UnicodeDecodeError) as exc:
+            got_first_message = True
             try:
                 _send_message(conn, _error_response(None, "ProtocolError", f"JSON invalide : {exc}"))
             except OSError:
@@ -220,8 +283,9 @@ def _handle_client(conn, stop_event):
             continue
 
         if request is None:
-            break  # client déconnecté ou arrêt demandé
+            break  # client déconnecté, arrêt demandé, ou premier message jamais reçu
 
+        got_first_message = True
         response = _dispatch(request)
         try:
             _send_message(conn, response)
@@ -229,12 +293,43 @@ def _handle_client(conn, stop_event):
             break
 
 
+def _refuse_extra_client(conn):
+    """Un client est déjà actif : refus propre avec une erreur JSON plutôt
+    que de laisser la connexion en attente indéfiniment (§1 spec Bloc 1)."""
+    try:
+        conn.settimeout(1.0)
+        _send_message(conn, _error_response(None, "BusyError", "Un client StudioPilot est déjà connecté."))
+    except OSError:
+        pass
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+def _serve_client(conn, stop_event):
+    """Tourne dans son propre thread (un par client actif). N'appelle
+    JAMAIS bpy — voir _handle_client. Libère `client_connected` en sortie,
+    quelle que soit la cause (déconnexion, erreur, arrêt du serveur)."""
+    try:
+        _handle_client(conn, stop_event)
+    finally:
+        _state["client_connected"] = False
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
 def _accept_loop(server_socket, stop_event):
     """Tourne dans un thread séparé. N'appelle JAMAIS bpy — bpy n'est pas
-    thread-safe. Accepte une connexion, délègue à _handle_client (protocole
-    JSON préfixé longueur), qui pousse les commandes dans _request_queue
-    pour exécution sur le thread principal via bpy.app.timers."""
+    thread-safe. Accepte les connexions en continu (jamais bloqué par un
+    client en cours de traitement, qui vit dans son propre thread) : un
+    seul client actif à la fois, toute connexion supplémentaire reçoit un
+    refus JSON propre puis est fermée."""
     server_socket.settimeout(0.5)
+    active_client_thread = None
     try:
         while not stop_event.is_set():
             try:
@@ -244,15 +339,23 @@ def _accept_loop(server_socket, stop_event):
             except OSError:
                 break
 
+            if active_client_thread is not None and not active_client_thread.is_alive():
+                active_client_thread = None
+
+            if active_client_thread is not None or _state["client_connected"]:
+                _refuse_extra_client(conn)
+                continue
+
             _state["client_connected"] = True
-            try:
-                _handle_client(conn, stop_event)
-            finally:
-                _state["client_connected"] = False
-                try:
-                    conn.close()
-                except OSError:
-                    pass
+            active_client_thread = threading.Thread(
+                target=_serve_client,
+                args=(conn, stop_event),
+                daemon=True,
+            )
+            active_client_thread.start()
+
+        if active_client_thread is not None:
+            active_client_thread.join(timeout=2.0)
     finally:
         try:
             server_socket.close()
@@ -260,16 +363,54 @@ def _accept_loop(server_socket, stop_event):
             pass
 
 
-def _redraw_timer():
-    """Force le rafraîchissement du panneau N pendant que le serveur tourne.
-    S'auto-désenregistre (retourne None) dès que le serveur est arrêté."""
-    if not _state["running"]:
-        return None
-    for window in bpy.context.window_manager.windows:
+def _tag_redraw_viewports(context):
+    for window in context.window_manager.windows:
         for area in window.screen.areas:
             if area.type == "VIEW_3D":
                 area.tag_redraw()
-    return 0.3
+
+
+class STUDIOPILOT_OT_modal_server(bpy.types.Operator):
+    """Boucle interne du bridge — invisible pour l'utilisateur.
+
+    Remplace le bpy.app.timers utilisé en Session 2 : celui-ci ne se
+    déclenche pas de façon fiable sans interaction Blender (confirmé
+    manuellement). Un opérateur modal avec un timer de window_manager
+    (event_timer_add) reçoit des événements TIMER dispatchés par Blender
+    indépendamment de toute interaction souris/clavier — c'est le
+    mécanisme recommandé pour du travail périodique sans UI.
+    """
+
+    bl_idname = "studiopilot.modal_server"
+    bl_label = "StudioPilot Bridge — boucle interne"
+    bl_options = {"INTERNAL"}
+
+    _timer = None
+
+    def modal(self, context, event):
+        if not _state["running"]:
+            self._stop_timer(context)
+            return {"FINISHED"}
+
+        if event.type == "TIMER":
+            _process_queue()
+            _tag_redraw_viewports(context)
+
+        return {"PASS_THROUGH"}
+
+    def execute(self, context):
+        window_manager = context.window_manager
+        window = context.window or (window_manager.windows[0] if window_manager.windows else None)
+        if window is None:
+            return {"CANCELLED"}  # aucune fenêtre disponible (ex. mode --background)
+        self._timer = window_manager.event_timer_add(0.05, window=window)
+        window_manager.modal_handler_add(self)
+        return {"RUNNING_MODAL"}
+
+    def _stop_timer(self, context):
+        if self._timer is not None:
+            context.window_manager.event_timer_remove(self._timer)
+            self._timer = None
 
 
 class STUDIOPILOT_OT_start_server(bpy.types.Operator):
@@ -314,8 +455,22 @@ class STUDIOPILOT_OT_start_server(bpy.types.Operator):
         _state["running"] = True
         thread.start()
 
-        bpy.app.timers.register(_redraw_timer, first_interval=0.3)
-        bpy.app.timers.register(_process_queue, first_interval=0.05)
+        try:
+            modal_result = bpy.ops.studiopilot.modal_server("INVOKE_DEFAULT")
+        except RuntimeError as exc:
+            modal_result = None
+            _state["error"] = f"Boucle interne non démarrée : {exc}"
+
+        if modal_result is None or "RUNNING_MODAL" not in modal_result:
+            # Pas de fenêtre disponible (ex. démarrage auto trop tôt, ou
+            # mode --background) : le serveur socket tourne quand même,
+            # mais aucune commande ne pourra être exécutée tant que la
+            # boucle modale n'aura pas pu démarrer (relancer depuis le
+            # panneau une fois une fenêtre Blender ouverte).
+            if _state["error"] is None:
+                _state["error"] = "Boucle interne non démarrée (aucune fenêtre Blender disponible)."
+            self.report({"WARNING"}, _state["error"])
+
         return {"FINISHED"}
 
 
@@ -415,6 +570,7 @@ classes = (
     StudioPilotBridgePreferences,
     STUDIOPILOT_OT_start_server,
     STUDIOPILOT_OT_stop_server,
+    STUDIOPILOT_OT_modal_server,
     STUDIOPILOT_PT_panel,
 )
 
