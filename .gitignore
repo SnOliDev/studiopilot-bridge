@@ -1,0 +1,6 @@
+# Artefact généré par test_client.py (Bloc 1 §[TESTS])
+test_screenshot.png
+
+# Bytecode Python
+__pycache__/
+*.pyc

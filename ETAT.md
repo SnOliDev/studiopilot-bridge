@@ -6,9 +6,12 @@
 
 ---
 
-## Bloc en cours : **Bloc 1 — Bridge Blender**
+## Bloc en cours : **Bloc 1 — Bridge Blender — ✅ TERMINÉ (6/6 sessions)**
 Spec complète : `BLOC1_bridge_blender.md`
 Dépôt cible : `studiopilot-bridge/` (GPL, séparé de l'app)
+Prochain bloc (Bloc 2 — Shell Tauri + Chat UI) **non démarré** — attend le
+feu vert d'Olivier (changement de bloc = décision produit, voir CLAUDE.md
+"CE QUE CLAUDE CODE NE DÉCIDE PAS SEUL").
 
 ---
 
@@ -38,9 +41,13 @@ Dépôt cible : `studiopilot-bridge/` (GPL, séparé de l'app)
 - [x] Confirmé par Olivier en conditions réelles : `get_scene_info` lit
   correctement sa scène (3 objets, caméra, moteur EEVEE détectés)
 - [x] Session 5 Bloc 1 : get_screenshot
+- [x] Session 6 Bloc 1 (dernière du bloc) : liste noire sécurité +
+  test_client.py + README
+- [x] **Bloc 1 terminé** : les 7 checks de `test_client.py` (6 tests spec,
+  test 2 en 2 vérifications) passent contre un vrai serveur socket
 
 ## 🔄 Prochaines tâches (dans l'ordre)
-- [ ] Session 6 Bloc 1 : liste noire sécurité + test_client.py + README
+- [ ] Attendre décision d'Olivier : démarrer le Bloc 2 (Shell Tauri + Chat UI) ?
 
 ## ❌ Problèmes ouverts
 - ⚠️ **Limite connue et acceptée (pas bloquante)** : une connexion qui envoie
@@ -55,12 +62,12 @@ Dépôt cible : `studiopilot-bridge/` (GPL, séparé de l'app)
 Aucune pour l'instant.
 
 ## 🔒 Alertes sécurité
-Aucune. Vérifié en Session 1, 2 et 3 : `grep "0.0.0.0"` et `grep "sk-ant"` sur
-`studiopilot_bridge.py` = zéro résultat.
-⚠️ Rappel : `execute_code` (Session 3) n'a **aucune** liste noire — c'est prévu
-par la spec Bloc 1 (liste noire = Session 6, garde-fou de défense en
-profondeur, la vraie validation est côté app au Bloc 4). Ne pas exposer ce
-bridge à un réseau non fiable avant la Session 6.
+Aucune. Vérifié Sessions 1-6 : `grep "0.0.0.0"` et `grep "sk-ant"` sur
+`studiopilot_bridge.py`, `test_client.py`, `README.md` = zéro résultat.
+`execute_code` a maintenant sa liste noire de défense en profondeur (11
+motifs, testés individuellement) — **rappel permanent (voir README)** :
+ce n'est toujours PAS une sandbox, contournable par du code habile ; la
+vraie validation reste côté app StudioPilot (Bloc 4).
 
 ## 📁 Fichiers modifiés ce jour
 - `studiopilot_bridge.py` — Session 1 (panneau N, start/stop serveur,
@@ -68,8 +75,12 @@ bridge à un réseau non fiable avant la Session 6.
   `queue.Queue` + commande `ping`) + Session 3 (`execute_code`, opérateur
   modal remplaçant `bpy.app.timers`, refus propre des connexions
   supplémentaires, abandon des connexions silencieuses, port par défaut 9877)
-  + Session 4 (`get_scene_info`) + Session 5 (`get_screenshot`)
+  + Session 4 (`get_scene_info`) + Session 5 (`get_screenshot`) + Session 6
+  (liste noire `SecurityError`, 11 motifs)
 - `BLOC1_bridge_blender.md` — port 9876 → 9877 (cohérence avec CLAUDE.md)
+- `test_client.py` — nouveau, client de test stdlib (6 tests spec Bloc 1)
+- `README.md` — réécrit : installation, protocole, sécurité, licences, limites
+- `.gitignore` — nouveau (`test_screenshot.png`, `__pycache__/`)
 
 ## 🧪 Session 1 — ✅ Vérification
 **Fichiers touchés** : `studiopilot_bridge.py` (nouveau).
@@ -303,21 +314,96 @@ image du viewport actuel (pas un rendu caméra) — objectif < 500 Ko et
 = zéro résultat. Aucune fuite de fichier temporaire constatée dans aucun cas
 testé, y compris les chemins d'erreur.
 
+## 🧪 Session 6 — ✅ Vérification (dernière session — BLOC 1 TERMINÉ)
+**Fichiers touchés** : `studiopilot_bridge.py`, `test_client.py` (nouveau),
+`README.md` (réécrit), `.gitignore` (nouveau).
+
+**Effet attendu** :
+1. **Liste noire `execute_code`** (`SecurityError`) : 11 motifs (§6 spec
+   Bloc 1) — `os.system`, `subprocess`, `shutil.rmtree`, `socket.`,
+   `urllib`, `requests`, `eval(`, `__import__`, `ctypes`, `sys.exit`,
+   `exec(` — recherche insensible à la casse, mot entier (`\b`) pour éviter
+   les faux positifs (ex. une variable nommée `requests_count` n'est PAS
+   bloquée). Rejet avant toute exécution, `status: error`,
+   `type: SecurityError`. **Toujours documenté comme défense en profondeur,
+   PAS une sandbox** — contournable, la vraie validation reste Bloc 4.
+2. **`test_client.py`** : client stdlib pur (socket/json/struct/base64/uuid),
+   implémente les 6 tests de la spec Bloc 1, affiche ✅/❌, code de sortie
+   0/1, options `--host`/`--port`.
+3. **`README.md`** réécrit : installation en 3 étapes, préférences, usage de
+   `test_client.py`, tableau du protocole/commandes, section sécurité
+   (ce que la liste noire protège et NE protège PAS), licences (GPL add-on
+   vs StudioPilot propriétaire, communication socket uniquement), limite du
+   timeout de 30 s documentée (§5 spec — ne tue pas un `exec` en cours).
+
+**🐛 Bug critique trouvé et corrigé pendant le test** : `test_client.py`
+plantait immédiatement avec `UnicodeEncodeError` dès le premier `print()`
+d'un ✅/❌ lorsque la sortie standard Python utilise un encodage qui ne
+supporte pas les emojis (`cp1252`, le cas par défaut de nombreuses consoles
+Windows hors terminaux UTF-8). **C'est exactement le genre d'échec silencieux
+qu'Olivier aurait pu rencontrer en lançant le script.** Corrigé en forçant
+`sys.stdout.reconfigure(encoding="utf-8", errors="replace")` en tête de
+script (Python 3.7+, ne dépend pas de la console utilisée).
+
+**Ce qui a été testé** :
+- **Liste noire** : les 11 motifs testés individuellement un par un
+  (`_cmd_execute_code` appelé en direct) → tous lèvent `SecurityError`.
+  4 cas légitimes testés en parallèle (variable `requests_count`, appel
+  `bpy.ops` normal, `print()`, `import math`) → aucun faux positif.
+- **`test_client.py` en conditions quasi réelles** : lancé comme un VRAI
+  process externe (pas un appel direct), connecté par socket TCP à un
+  serveur bridge tournant dans Blender headless (port 19878, isolé du
+  Blender GUI de la machine sur 9877) → **les 7 checks passent** (ping,
+  execute_code + vérification scène, erreur volontaire, liste noire,
+  screenshot ≤ 800px sauvé sur disque, 20 `get_scene_info` d'affilée).
+  `test_screenshot.png` généré et lisible avec succès.
+
+**⚠️ Astuce de test notée pour référence** : dans cet environnement sans
+GPU, le tout premier rendu d'une session Blender coûte ~80 s (compilation
+de shaders) contre quelques secondes ensuite — un serveur "à froid" aurait
+donc fait échouer le test 5 (`get_screenshot`) par timeout de commande
+(30 s). Une capture de chauffe avant de démarrer le serveur a contourné ça
+pour le test. **Ce coût ponctuel de démarrage n'existe pas en usage réel**
+(GPU déjà actif dans la session Blender de l'utilisateur) mais mérite
+d'être gardé à l'esprit si un `get_screenshot` semble anormalement lent au
+tout premier appel d'une session Blender fraîchement ouverte.
+
+**Sécurité** : `grep "0.0.0.0"`/`grep "sk-ant"` = zéro résultat sur les 3
+fichiers touchés. Aucune clé, aucun secret.
+
+**🏁 Critère de sortie du Bloc 1** (spec §[VÉRIFICATION]) :
+- ✅ Add-on installable sans dépendance externe (stdlib Blender uniquement)
+- ✅ Les 6 tests de `test_client.py` passent (vérifié via un vrai socket)
+- ✅ Blender reste fluide pendant que le serveur écoute (opérateur modal,
+  pas de blocage du thread principal hors exécution d'une commande)
+- ✅ Kill du client → serveur revient en écoute sans redémarrer Blender
+- ✅ Port occupé au démarrage → message d'erreur clair, pas de crash
+- ✅ Aucun bind hors 127.0.0.1
+- 🔄 Screenshot avec 0/1/200 objets : testé en Session 5 (0 objet échoue
+  proprement faute de caméra, comportement attendu et documenté)
+- ⚠️ **Nuance** : testé sur **Blender 5.1.2** (confirmé par toi en
+  conditions réelles pour les Sessions 1-5), pas la cible officielle
+  **4.2 LTS** (non installée dans cet environnement de dev). Rien dans le
+  code ne cible spécifiquement une API absente de 4.2 ; à confirmer si tu
+  installes un jour la 4.2 LTS en parallèle.
+
 ## ▶️ Prochaine étape exacte
-Session 6 Bloc 1 (dernière session du bloc) : liste noire de sécurité
-côté add-on (défense en profondeur sur `execute_code` — `os.system`,
-`subprocess`, `shutil.rmtree`, `socket.`, `urllib`, `requests`, `eval(`,
-`__import__`, `ctypes`, `sys.exit`, `exec(`), `test_client.py` complet
-(les 6 tests de la spec Bloc 1), et README (installation + licence GPL).
-Critère de sortie du Bloc 1 : les 6 tests de `test_client.py` passent sur
-Windows + Blender 4.2.
+**Bloc 1 terminé.** Rien à faire côté add-on sauf si tu identifies un bug en
+usage réel prolongé. Prochaine décision : veux-tu que je commence le Bloc 2
+(Shell Tauri + Chat UI) ? C'est un nouveau dépôt/projet (l'app StudioPilot
+propriétaire), pas ce dépôt GPL — dis-moi comment tu veux l'organiser
+(nouveau dépôt séparé ? dossier `app/` dans un mono-repo ?) si ce n'est pas
+déjà tranché ailleurs.
 
 ## 🙋 Pour toi, Olivier
-Rien de bloquant. Si tu veux valider Session 5 en conditions réelles :
-réinstalle `studiopilot_bridge.py` mis à jour, redémarre le serveur, et
-demande un `get_screenshot` (je peux t'écrire un script comme pour les
-sessions précédentes) — ça doit répondre vite avec une image de ton
-viewport actuel, pas un rendu caméra complet.
+Le Bloc 1 est fonctionnellement complet et testé (par moi en headless, par
+toi en conditions réelles à chaque session). Pour une dernière passe de ta
+part avant de tourner la page :
+1. `git pull` sur `dev`, réinstalle `studiopilot_bridge.py`.
+2. Lance `python test_client.py` (depuis le dossier du dépôt, avec Blender
+   ouvert + serveur démarré) — les 6 tests devraient passer chez toi aussi.
+3. Si tout est bon, tu peux merger `dev` → `main` quand tu le souhaites
+   (c'est à toi de le faire, pas moi — voir CLAUDE.md).
 
 ---
 

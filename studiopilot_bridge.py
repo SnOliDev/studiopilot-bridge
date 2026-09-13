@@ -46,6 +46,11 @@ conditions réelles, confirmé) :
      la place pour un vrai client.
 Session 4 : commande `get_scene_info`.
 Session 5 : commande `get_screenshot`.
+Session 6 (dernière du Bloc 1) : liste noire de sécurité (défense en
+profondeur sur `execute_code` — voir SecurityError plus bas), test_client.py
+et README dans le dépôt. La validation principale du code généré reste
+côté app StudioPilot (Bloc 4) : cette liste noire ne protège que contre les
+appels les plus évidents, elle n'est PAS une sandbox.
 """
 
 import base64
@@ -57,6 +62,7 @@ import math
 import os
 import queue
 import random
+import re
 import socket
 import struct
 import sys
@@ -126,17 +132,61 @@ def _cmd_ping(params):
     }
 
 
-def _cmd_execute_code(params):
-    """Exécute du code bpy arbitraire sur le thread principal.
+class SecurityError(Exception):
+    """Levée par la liste noire de `execute_code` (§6 spec Bloc 1).
 
-    ⚠️ Aucune liste noire ici — c'est un garde-fou de défense en profondeur
-    prévu pour la Session 6 (§6 spec Bloc 1). La validation principale est
-    côté app StudioPilot (Bloc 4). Ne PAS considérer cette commande comme
-    sûre avant la Session 6.
+    ⚠️ Défense en profondeur UNIQUEMENT — PAS la sandbox principale. La
+    validation réelle du code généré par le LLM est côté app StudioPilot
+    (Bloc 4). Un contournement de cette liste noire (ex. espace entre
+    `eval` et `(`, alias d'import) n'est ni surprenant ni à corriger ici :
+    c'est le rôle du Bloc 4, pas de ce garde-fou minimal.
     """
+
+
+# Motifs interdits (§6 spec Bloc 1) — recherche insensible à la casse, mot
+# entier (\b) pour éviter les faux positifs du type "subprocessing_lib".
+# "socket." et "eval("/"exec(" n'ont pas de \b final : on veut bloquer
+# TOUT usage (n'importe quel attribut de socket, tout appel eval/exec),
+# pas seulement le token isolé.
+_BLACKLIST_PATTERNS = [
+    (r"\bos\.system\b", "os.system"),
+    (r"\bsubprocess\b", "subprocess"),
+    (r"\bshutil\.rmtree\b", "shutil.rmtree"),
+    (r"\bsocket\.", "socket."),
+    (r"\burllib\b", "urllib"),
+    (r"\brequests\b", "requests"),
+    (r"\beval\(", "eval("),
+    (r"\b__import__\b", "__import__"),
+    (r"\bctypes\b", "ctypes"),
+    (r"\bsys\.exit\b", "sys.exit"),
+    (r"\bexec\(", "exec("),
+]
+_BLACKLIST_REGEX = [(re.compile(pattern, re.IGNORECASE), label) for pattern, label in _BLACKLIST_PATTERNS]
+
+
+def _find_blacklisted_pattern(code):
+    """Retourne le libellé du premier motif interdit trouvé dans `code`,
+    ou None si aucun ne matche."""
+    for regex, label in _BLACKLIST_REGEX:
+        if regex.search(code):
+            return label
+    return None
+
+
+def _cmd_execute_code(params):
+    """Exécute du code bpy arbitraire sur le thread principal, après
+    passage par la liste noire de secours (voir SecurityError).
+
+    ⚠️ La liste noire est une défense en profondeur, PAS une sandbox — un
+    code malveillant suffisamment habile peut la contourner. La validation
+    principale reste côté app StudioPilot (Bloc 4)."""
     code = params.get("code", "")
     if not isinstance(code, str):
         raise TypeError("params.code doit être une chaîne de caractères")
+
+    blocked_pattern = _find_blacklisted_pattern(code)
+    if blocked_pattern is not None:
+        raise SecurityError(f"Motif interdit détecté dans le code : {blocked_pattern!r}")
 
     namespace = {"bpy": bpy, "math": math, "mathutils": mathutils, "random": random}
     stdout_capture = io.StringIO()
